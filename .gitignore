@@ -1,0 +1,19 @@
+# Environment & Secrets
+.env
+.streamlit/secrets.toml
+
+# Local Persistent Storage
+.veridoc_storage/
+faiss_index/
+chroma_db/
+
+# Python / Virtual Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# macOS / Editor
+.DS_Store
+.vscode/
