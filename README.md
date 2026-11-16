@@ -21,12 +21,12 @@ Reading through 50–100 page company policies, contracts, or technical manuals 
 
 ```mermaid
 flowchart TD
-    A["1. Upload Files (PDF, DOCX, TXT, CSV)"] --> B["2. Split into Searchable Chunks"]
-    B --> C["3. Search by Meaning (FAISS) + Exact Words (BM25)"]
-    C --> D["4. Re-Rank Best Matches & Score Confidence (0-100%)"]
-    D --> E{"5. Found in Documents?"}
-    E -- "Yes" --> F["Answer with Verified Source Citations"]
-    E -- "No" --> G["Warn User & Give General AI Answer (or Refuse in Strict Mode)"]
+    A["1. Upload Files\n(PDF, DOCX, TXT, CSV)"] --> B["2. Split into\nSearchable Chunks"]
+    B --> C["3. Two-Way Search\n(Meaning + Keywords)"]
+    C --> D["4. Re-Rank & Score\nConfidence (0-100%)"]
+    D --> E{"5. Found in\nDocuments?"}
+    E -- "Yes" --> F["Answer with Verified\nSource Citations"]
+    E -- "No" --> G["Warn User + General AI\n(or Refuse in Strict Mode)"]
 ```
 
 ---
