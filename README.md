@@ -116,26 +116,29 @@ Every question can be rewritten into a standalone query from recent conversation
 
 ---
 
-## 7-Case Smoke Test
+## 10-Case Smoke Test
 
-Evaluated on `ACME_Enterprise_Arch_2026.pdf` via `eval_suite.py` using `qwen/qwen3.8-27b` (`temperature=0.0` for evaluation and judging):
+Evaluated across **3 runs** on `ACME_Enterprise_Arch_2026.pdf` via `eval_suite.py` with **`qwen/qwen3.8-27b`** as the generator and a separate **`openai/gpt-oss-120b`** model as the LLM-as-a-Judge (`temperature=0.0`):
 
-- **Dataset split:** **5 In-Domain** technical questions + **2 Off-Topic** questions.
-- **Judge & fallback behavior:** The same selected `ChatGroq` model (`qwen/qwen3.8-27b`) acts as LLM-as-a-Judge for faithfulness and correctness. `eval_suite.py` tracks JSON parse failures in `judge_fallbacks` (falling back to `80.0` if parsing fails); on this run **`judge_fallbacks` was `0`** (all 5 in-domain judge calls parsed cleanly: faithfulness `100%` × 5; correctness `100%, 100%, 50%, 50%, 33%`).
+- **Dataset split:** **5 In-Domain** technical questions + **5 Off-Topic** questions (**2** general + **3** near-domain enterprise/ACME questions about 2025 revenue/EBITDA, SLA breach refund policy, and cloud migration budget/quarter).
+- **Judge & fallback behavior:** `openai/gpt-oss-120b` scores faithfulness and correctness in JSON (`judge_fallbacks` tracks parse failures defaulting to `80.0`). Across all 3 runs, fallbacks were **`0 of 15 judge calls`** (`0 of 5` per run).
 - **How each metric is scored:**
   - **Hit Rate@K & MRR:** Case-insensitive **string match** checking whether `expected_keyword` appears in `doc.page_content` of the top reranked chunks.
-  - **Faithfulness & Answer Correctness:** **LLM-as-a-Judge** scoring `0–100` in JSON (`faithfulness` vs. retrieved context; `correctness` vs. `expected_answer`).
-  - **Off-Topic Rejection:** Passes if top Cross-Encoder relevance score is below threshold, or if the LLM outputs the `NOT_FOUND` sentinel.
+  - **Faithfulness & Answer Correctness:** Separate **LLM-as-a-Judge** (`openai/gpt-oss-120b`) scoring `0–100` in JSON (`faithfulness` vs. retrieved context; `correctness` vs. `expected_answer`).
+  - **Off-Topic Rejection:** Passes if top Cross-Encoder relevance score is below threshold (`25%`), or if the generator outputs the `NOT_FOUND` sentinel.
 
-| Metric | Score | Notes |
-| :--- | :---: | :--- |
-| **Retrieval Hit Rate@K** | **100.0%** | 5/5 in-domain queries matched `expected_keyword` at **Rank #1** |
-| **Mean Reciprocal Rank (MRR)** | **1.00** | Top-ranked chunk hit on every in-domain case |
-| **Faithfulness** | **100.0%** | Judge found zero unsupported claims across all 5 in-domain answers |
-| **Off-Topic Rejection** | **100.0%** | 2/2 off-topic queries scored `0.0%` relevance and triggered fallback |
-| **Answer Correctness** | **66.6%** | Lower because `expected_answer` bundles extra section facts while the generator prompt asks to be concise |
+| Metric | 3-Run Mean | 3-Run Range | Notes |
+| :--- | :---: | :---: | :--- |
+| **Retrieval Hit Rate@K** | **100.0%** | `100.0%–100.0%` | 5/5 in-domain queries matched `expected_keyword` at **Rank #1** |
+| **Mean Reciprocal Rank (MRR)** | **1.00** | `1.00–1.00` | Top-ranked chunk hit on every in-domain case |
+| **Faithfulness** | **95.5%** | `86.6%–100.0%` | Runs scored `100.0%`, `86.6%`, `100.0%` |
+| **Answer Correctness** | **69.1%** | `67.6%–71.0%` | Lower because `expected_answer` bundles extra section facts while the generator prompt asks to be concise |
+| **Off-Topic Rejection (Total)** | **100.0%** | `100.0%–100.0%` | All 5 off-topic queries were rejected across all 3 runs |
+| **Off-Topic Gate Only** | **60.0%** | `60.0%–60.0%` | 2 general (`0.0%`) + 1 near-domain refund (`6.8%`) passed the `25%` gate |
 
-> *Note: This 7-case suite is a lightweight smoke test, not a full benchmark; a larger multi-document evaluation set is on the roadmap.*
+> **Plain near-domain gate finding:** **2 of the 3 near-domain off-topic queries failed the `25%` Cross-Encoder relevance gate** across every run—*"2025 annual revenue and EBITDA margin"* scored **`35.4%`** and *"cloud migration budget and target completion quarter"* scored **`92.9%`** (because `"ACME Corp"` and `"Cloud Migration"` match the document header strongly). Both were caught downstream by the LLM `NOT_FOUND` sentinel rather than the relevance gate alone.
+
+> *Note: This 10-case suite is a lightweight smoke test, not a full benchmark; a larger multi-document evaluation set is on the roadmap.*
 
 ---
 
@@ -145,7 +148,7 @@ Evaluated on `ACME_Enterprise_Arch_2026.pdf` via `eval_suite.py` using `qwen/qwe
 - `ingest.py` — Multi-format parsing (`.pdf`, `.docx`, `.txt`, `.csv`), chunking, deduplication, and demo doc
 - `retrieval.py` — Normalized `FAISS` + regex `BM25`, weighted RRF fusion (`c=60`), sigmoid Cross-Encoder reranking, and citation checks
 - `storage.py` — Validated session-namespaced atomic persistence (`.veridoc_storage/<sid>/`), integrity checks, and 7-day purge
-- `eval_suite.py` — 7-case retrieval, LLM-as-a-Judge faithfulness/correctness (with `judge_fallbacks` tracking), and off-topic rejection smoke test
+- `eval_suite.py` — 10-case retrieval, separate-judge (`openai/gpt-oss-120b`) faithfulness/correctness, and off-topic rejection smoke test
 - `requirements.txt` — Python package dependencies
 - `.env.example` — Environment variable template (`GROQ_API_KEY`)
 
