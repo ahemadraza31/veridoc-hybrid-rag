@@ -1,86 +1,84 @@
-# ⚡ VeriDoc AI — Enterprise Hybrid RAG & Document Intelligence Platform
+# ⚡ VeriDoc AI — Smart Document Q&A Assistant
 
-**VeriDoc AI** is a production-grade Retrieval-Augmented Generation (RAG) engine built for multi-document enterprise knowledge retrieval. It combines **Dense Vector Search (FAISS)**, **Sparse Lexical Search (BM25)**, **MS-MARCO Cross-Encoder Re-Ranking**, **Conversational Query Rewriting**, and **Strict Citation Validation** inside an interactive **Streamlit** dashboard.
+**VeriDoc AI** lets you upload PDFs, Word documents, text files, or spreadsheets and ask questions in plain English—getting **fast, accurate answers with exact source references** so you know where every fact came from.
 
-> 🚀 **Live Demo:** **[veridoc-rag-ahemad.streamlit.app](https://veridoc-rag-ahemad.streamlit.app/)**
-
----
-
-## 🎯 Problem Statement
-
-Standard "naive" vector RAG pipelines frequently fail on enterprise documentation (compliance standards, technical specs, financial reports) due to:
-1. **Exact-Term Misses:** Dense embeddings alone struggle with exact identifiers, protocol versions (`TLS 1.3`, `PKCE`), and numeric thresholds (`99.99%`, `200ms`).
-2. **Context Noise & Hallucinations:** Unfiltered vector retrieval passes distractor chunks into the LLM context window.
-3. **No Out-of-Domain Guardrails:** Basic RAG apps force-fit irrelevant chunks when asked off-topic questions.
-
-**VeriDoc AI** solves these with a tunable Hybrid + Re-Ranking pipeline, sigmoid confidence gating, and automated citation verification.
+> 🚀 **Try the Live App:** **[veridoc-rag-ahemad.streamlit.app](https://veridoc-rag-ahemad.streamlit.app/)**
 
 ---
 
-## 🏗️ System Architecture
+## 💡 Why I Built This (The Problem)
+
+Reading through 50–100 page company policies, contracts, or technical manuals to find one specific answer takes too much time. On the other hand, pasting entire files into a normal AI chatbot often leads to:
+- **Made-up answers (hallucinations)** when the AI guesses instead of checking the file.
+- **Missed details** like exact numbers, codes, or policy rules.
+- **No proof** of which page or paragraph an answer came from.
+
+**VeriDoc AI** solves this by searching your documents **two ways at once** (by meaning *and* by exact keywords), double-checking the best paragraphs before answering, and showing you the exact source snippets with a confidence score.
+
+---
+
+## ⚙️ How It Works (In Simple Steps)
 
 ```mermaid
 flowchart TD
-    A["Multi-Format Ingestion (PDF / DOCX / TXT / CSV)"] --> B["Recursive Chunking + Page/Chunk Metadata"]
-    B --> C["Dense Index (FAISS + Normalized MiniLM)"]
-    B --> D["Sparse Index (BM25 + Regex Tokenizer)"]
-    Q["User Query + Chat History"] --> R["Conversational Query Rewriter / Optional HyDE"]
-    R --> E["EnsembleRetriever (Tunable Alpha)"]
-    C --> E
-    D --> E
-    E --> F["MS-MARCO Cross-Encoder Reranker (Sigmoid 0-100%)"]
-    F --> G{"Confidence >= Threshold?"}
-    G -- "Yes" --> H["Groq Streaming LLM + Inline Citations"]
-    H --> I["Citation Validator (Verifies Chunk IDs)"]
-    G -- "No (Strict Mode ON)" --> J["Refusal Notice"]
-    G -- "No (Strict Mode OFF)" --> K["Explicit Disclaimer + General LLM Fallback"]
+    A["1. Upload Files (PDF, DOCX, TXT, CSV)"] --> B["2. Split into Searchable Chunks"]
+    B --> C["3. Search by Meaning (FAISS) + Exact Words (BM25)"]
+    C --> D["4. Re-Rank Best Matches & Score Confidence (0-100%)"]
+    D --> E{"5. Found in Documents?"}
+    E -- "Yes" --> F["Answer with Verified Source Citations"]
+    E -- "No" --> G["Warn User & Give General AI Answer (or Refuse in Strict Mode)"]
 ```
 
 ---
 
-## ✨ Key Engineering Features
+## ✨ Key Features
 
-- **Modular Codebase:** Cleanly separated into `ingest.py`, `retrieval.py`, `storage.py`, `eval_suite.py`, and `app.py`.
-- **Hybrid Retrieval + Custom BM25:** Combines normalized `all-MiniLM-L6-v2` FAISS vectors with a case- and punctuation-insensitive regex BM25 tokenizer.
-- **Cross-Encoder Re-Ranking & Confidence Gate:** Converts raw MS-MARCO logits via sigmoid into `0–100%` confidence scores and filters out low-relevance distractors.
-- **Hallucination & Citation Guardrails:** Enforces `NOT_FOUND` sentinel fallback, Strict Document-Only mode, and post-generation citation ID validation.
-- **Session-Namespaced Persistence:** Saves FAISS indexes, document chunks, and chat history to disk across page refreshes, with per-document deletion and Markdown export.
-- **Built-In Observability & Evaluation:** Includes a **Retrieval Inspector** tab (BM25 vs. FAISS vs. Reranked) and an **Accuracy & Eval** benchmark tab.
+- **Multi-Format Upload:** Works with `.pdf`, `.docx`, `.txt`, and `.csv` files (plus a 1-click **Load Demo Enterprise Doc** button).
+- **Two-Way Smart Search:** Combines semantic search (understands what you mean) with keyword search (catches exact terms like `TLS 1.3` or `99.99%`).
+- **Confidence Check & Source Cards:** Every answer shows the exact document snippets used and a `0–100%` confidence score.
+- **Honest Off-Topic Handling:** If your question isn't covered in the uploaded files, the app clearly warns you before giving a general AI answer—or refuses if **Strict Document-Only Mode** is turned on.
+- **Saves Your Session:** Uploaded files and chat history stay saved even if you refresh the page, with options to delete individual files or export your chat as Markdown.
+- **Built-In Transparency Tabs:** Includes a **Retrieval Inspector** (compare keyword vs. meaning search side by side) and an **Accuracy & Eval** tab to test accuracy live.
 
 ---
 
-## 📊 Verified Evaluation Benchmark
+## 📊 Tested Accuracy (7-Case Benchmark)
 
-Evaluated on the 7-case enterprise benchmark (`eval_suite.py` using `qwen/qwen3.8-27b`, 50% FAISS / 50% BM25, Cross-Encoder ON):
+Evaluated using the built-in test suite (`eval_suite.py`):
 
-| Metric | Score | Notes |
+| What Was Tested | Result | What It Means |
 | :--- | :---: | :--- |
-| **Retrieval Hit Rate@K** | **100.0%** | 5/5 in-domain queries retrieved the target chunk at **Rank #1** |
-| **Mean Reciprocal Rank (MRR)** | **1.00** | Top-ranked chunk matched every in-domain ground-truth query |
-| **Faithfulness** | **100.0%** | Zero unsupported/hallucinated claims across all in-domain answers |
-| **Off-Topic Rejection Rate** | **100.0%** | 2/2 off-topic queries scored `0.0%` confidence and triggered fallback |
-| **Answer Correctness (Strict Judge)** | **68.6%** | Scored against full multi-fact reference strings |
+| **Finding the Right Paragraph** | **100.0%** | Found the exact right section on the first try for every test question |
+| **No Made-Up Facts (Faithfulness)** | **100.0%** | Every answer stuck strictly to what was written in the document |
+| **Catching Unrelated Questions** | **100.0%** | Correctly flagged off-topic questions instead of faking a source |
+| **Overall Answer Completeness** | **68.6%** | Graded strictly against full multi-part reference answers |
 
 ---
 
-## 🚀 Local Setup & Deployment
+## 🛠️ Project Structure
 
-### 1. Run Locally
+- `app.py` — Main Streamlit web app and user interface
+- `ingest.py` — Reads PDF, Word, text, and CSV files into clean chunks
+- `retrieval.py` — Two-way search (FAISS + BM25), re-ranking, and citation checks
+- `storage.py` — Saves your uploaded index and chat history across refreshes
+- `eval_suite.py` — Automated accuracy test suite
+
+---
+
+## 🚀 Run It Yourself
+
 ```bash
-git clone https://github.com/<your-username>/veridoc-hybrid-rag.git
+git clone https://github.com/ahemadraza31/veridoc-hybrid-rag.git
 cd veridoc-hybrid-rag
 pip install -r requirements.txt
 ```
-Create a `.env` file:
+
+Create a `.env` file with your Groq API key:
 ```env
 GROQ_API_KEY=your_groq_api_key_here
 ```
-Launch the app:
+
+Start the app:
 ```bash
 streamlit run app.py
 ```
-
-### 2. Deploy on Streamlit Community Cloud (Free)
-1. Push this repository to GitHub (`.env` and `.veridoc_storage/` are excluded via `.gitignore`).
-2. Go to [share.streamlit.io](https://share.streamlit.io) → **Create app** → select `app.py`.
-3. Add `GROQ_API_KEY = "your_key"` under **Advanced settings → Secrets** and click **Deploy**.
