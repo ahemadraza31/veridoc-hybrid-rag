@@ -1,17 +1,9 @@
 import math
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
-
-try:
-    from langchain_classic.retrievers import EnsembleRetriever
-except ImportError:
-    try:
-        from langchain.retrievers import EnsembleRetriever
-    except ImportError:
-        from langchain_community.retrievers.ensemble import EnsembleRetriever
 
 
 def bm25_tokenize(text: str) -> List[str]:
@@ -20,7 +12,7 @@ def bm25_tokenize(text: str) -> List[str]:
 
 
 def sigmoid(logit: float) -> float:
-    """Convert raw Cross-Encoder logit into a [0, 1] confidence probability."""
+    """Convert raw Cross-Encoder logit into a [0, 1] relevance score (not a calibrated probability)."""
     if logit >= 0:
         return 1.0 / (1.0 + math.exp(-logit))
     z = math.exp(logit)
@@ -28,76 +20,97 @@ def sigmoid(logit: float) -> float:
 
 
 def strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks emitted by some LLMs."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    """Remove closed and unclosed <think> reasoning blocks; raise if empty afterward."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL).strip()
+    if not cleaned:
+        raise ValueError("Model returned an empty response after stripping reasoning tags.")
+    return cleaned
+
+
+def weighted_rrf(
+    bm25_docs: List[Document],
+    faiss_docs: List[Document],
+    dense_weight: float = 0.5,
+    c: int = 60,
+) -> List[Tuple[Document, float]]:
+    """Fuse BM25 and FAISS ranked lists using weighted Reciprocal Rank Fusion (RRF)."""
+    sparse_weight = round(1.0 - dense_weight, 4)
+    scores: Dict[Tuple[str, str], float] = {}
+    doc_map: Dict[Tuple[str, str], Document] = {}
+
+    for rank, doc in enumerate(bm25_docs, start=1):
+        key = (str(doc.metadata.get("chunk_id", "")), doc.page_content)
+        doc_map[key] = doc
+        scores[key] = scores.get(key, 0.0) + sparse_weight / (c + rank)
+
+    for rank, doc in enumerate(faiss_docs, start=1):
+        key = (str(doc.metadata.get("chunk_id", "")), doc.page_content)
+        doc_map[key] = doc
+        scores[key] = scores.get(key, 0.0) + dense_weight / (c + rank)
+
+    fused = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [(doc_map[key], rrf_score) for key, rrf_score in fused]
 
 
 def build_or_update_index(
     chunks: List[Document],
     embed_model,
-    dense_weight: float = 0.5,
-    existing_faiss: FAISS = None,
-    new_chunks: List[Document] = None,
-) -> Tuple[FAISS, BM25Retriever, EnsembleRetriever]:
+    existing_faiss: Optional[FAISS] = None,
+    new_chunks: Optional[List[Document]] = None,
+) -> Tuple[FAISS, BM25Retriever]:
     """
-    Incrementally add new_chunks to existing_faiss if provided, or build fresh.
-    Always rebuilds BM25 (fast in-memory) over the full chunks list.
+    Reuse existing_faiss when provided (only embedding new_chunks if non-empty),
+    or build a fresh FAISS index. Always rebuilds BM25 over the full chunks list.
     """
-    if existing_faiss is not None and new_chunks:
-        existing_faiss.add_documents(new_chunks)
+    if existing_faiss is not None:
         faiss_db = existing_faiss
+        if new_chunks:
+            faiss_db.add_documents(new_chunks)
     else:
         faiss_db = FAISS.from_documents(chunks, embed_model)
 
-    faiss_retriever = faiss_db.as_retriever(search_kwargs={"k": 8})
     bm25_ret = BM25Retriever.from_documents(chunks, preprocess_func=bm25_tokenize)
     bm25_ret.k = 8
-
-    ensemble = EnsembleRetriever(
-        retrievers=[bm25_ret, faiss_retriever],
-        weights=[round(1.0 - dense_weight, 2), round(dense_weight, 2)],
-    )
-    return faiss_db, bm25_ret, ensemble
+    return faiss_db, bm25_ret
 
 
 def retrieve_and_rerank(
     query: str,
     bm25_ret: BM25Retriever,
     faiss_db: FAISS,
-    ensemble: EnsembleRetriever,
     dense_weight: float,
     top_k: int,
     context_k: int,
     use_reranker: bool,
     cross_encoder=None,
+    dense_query: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Execute BM25, FAISS, Hybrid Ensemble, and Cross-Encoder reranking.
-    Returns ranked chunks plus separate BM25 & FAISS lists for the Retrieval Inspector.
+    Execute BM25 (on query) and FAISS (on dense_query or query) once, fuse with weighted RRF (c=60),
+    and optionally rerank with Cross-Encoder on query.
     """
     bm25_ret.k = top_k
-    faiss_ret = faiss_db.as_retriever(search_kwargs={"k": top_k})
-    ensemble.retrievers = [bm25_ret, faiss_ret]
-    ensemble.weights = [round(1.0 - dense_weight, 2), round(dense_weight, 2)]
-
     bm25_docs = bm25_ret.invoke(query)
-    faiss_docs_with_scores = faiss_db.similarity_search_with_score(query, k=top_k)
+
+    faiss_q = dense_query if dense_query else query
+    faiss_docs_with_scores = faiss_db.similarity_search_with_score(faiss_q, k=top_k)
     faiss_docs = [doc for doc, _ in faiss_docs_with_scores]
-    hybrid_docs = ensemble.invoke(query)
+
+    fused_docs = weighted_rrf(bm25_docs, faiss_docs, dense_weight=dense_weight, c=60)
 
     scored_chunks: List[Dict[str, Any]] = []
-    if use_reranker and cross_encoder is not None and hybrid_docs:
-        pairs = [[query, doc.page_content] for doc in hybrid_docs]
+    if use_reranker and cross_encoder is not None and fused_docs:
+        candidates = [doc for doc, _ in fused_docs]
+        pairs = [[query, doc.page_content] for doc in candidates]
         logits = cross_encoder.predict(pairs)
-        for doc, logit in zip(hybrid_docs, logits):
+        for doc, logit in zip(candidates, logits):
             prob = sigmoid(float(logit))
             scored_chunks.append({"doc": doc, "score": prob, "logit": float(logit)})
         scored_chunks.sort(key=lambda x: x["score"], reverse=True)
     else:
-        for rank, doc in enumerate(hybrid_docs):
-            # Reciprocal rank approximation when Cross-Encoder is OFF
-            approx_score = round(1.0 / (rank + 1), 4)
-            scored_chunks.append({"doc": doc, "score": approx_score, "logit": None})
+        for doc, rrf_score in fused_docs:
+            scored_chunks.append({"doc": doc, "score": float(rrf_score), "logit": None})
 
     return {
         "scored_chunks": scored_chunks[:context_k],

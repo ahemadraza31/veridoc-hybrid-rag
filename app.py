@@ -18,12 +18,16 @@ from retrieval import (
     strip_think_tags,
 )
 from storage import (
+    SESSION_ID_RE,
     save_persisted_state,
     save_chat_history,
     load_persisted_state,
     clear_persisted_state,
+    purge_old_sessions,
 )
 from eval_suite import run_evaluation
+
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Load local .env if present
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +41,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# API Key Resolution (env + st.secrets top-level or nested + sidebar fallback)
+
 def _resolve_groq_key() -> str:
     env_key = os.getenv("GROQ_API_KEY", "").strip()
     if env_key:
@@ -54,8 +58,6 @@ def _resolve_groq_key() -> str:
 
 
 groq_api_key = _resolve_groq_key()
-if groq_api_key:
-    os.environ["GROQ_API_KEY"] = groq_api_key
 
 # Theme-safe Custom Styling (works in both Light & Dark themes)
 st.markdown(
@@ -105,7 +107,7 @@ st.markdown(
 @st.cache_resource(show_spinner="Loading MiniLM Embeddings (normalized)...")
 def get_embedding_model():
     return HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
+        model_name=EMBEDDING_MODEL_NAME,
         encode_kwargs={"normalize_embeddings": True},
     )
 
@@ -117,11 +119,18 @@ def get_cross_encoder():
 
 # ----------------- SESSION INITIALIZATION -----------------
 if "session_id" not in st.session_state:
-    st.session_state.session_id = st.query_params.get("sid", str(uuid.uuid4())[:8])
+    raw_sid = str(st.query_params.get("sid", "")).strip()
+    if SESSION_ID_RE.fullmatch(raw_sid):
+        valid_sid = raw_sid
+    else:
+        valid_sid = uuid.uuid4().hex[:16]
+    st.session_state.session_id = valid_sid
+    st.query_params["sid"] = valid_sid
 
 if "initialized" not in st.session_state:
+    purge_old_sessions(max_age_days=7)
+
     st.session_state.chat_history = []
-    st.session_state.ensemble_retriever = None
     st.session_state.faiss_store = None
     st.session_state.bm25_retriever = None
     st.session_state.all_documents = []
@@ -132,20 +141,18 @@ if "initialized" not in st.session_state:
 
     embed_model = get_embedding_model()
     faiss_db, chunks, files, d_weight, chat_hist, warn_msg = load_persisted_state(
-        st.session_state.session_id, embed_model
+        st.session_state.session_id,
+        embed_model,
+        expected_embedding_model=EMBEDDING_MODEL_NAME,
     )
-    if warn_msg:
-        st.session_state.startup_warning = warn_msg
-    else:
-        st.session_state.startup_warning = None
+    st.session_state.startup_warning = warn_msg
 
     if faiss_db is not None and chunks:
-        _, bm25_ret, ensemble = build_or_update_index(
-            chunks, embed_model, dense_weight=d_weight, existing_faiss=faiss_db
+        _, bm25_ret = build_or_update_index(
+            chunks, embed_model, existing_faiss=faiss_db
         )
         st.session_state.faiss_store = faiss_db
         st.session_state.bm25_retriever = bm25_ret
-        st.session_state.ensemble_retriever = ensemble
         st.session_state.all_documents = chunks
         st.session_state.indexed_files = files
         st.session_state.dense_weight = d_weight
@@ -159,7 +166,6 @@ def render_source_cards(sources: List[Dict[str, Any]]):
         safe_source = html.escape(str(src["source"]))
         safe_id = html.escape(str(src["chunk_id"]))
         safe_score = html.escape(str(src["score"]))
-        # Flatten markdown headings in snippet preview so cards stay compact
         clean_snip = re.sub(r"^#+\s*", "", str(src["snippet"]), flags=re.MULTILINE)
         safe_snippet = html.escape(clean_snip).replace("\n", " ")
         st.markdown(
@@ -168,7 +174,7 @@ def render_source_cards(sources: List[Dict[str, Any]]):
                 <div class="chunk-meta">
                     <strong>Source:</strong> {safe_source} &nbsp;|&nbsp;
                     <strong>ID:</strong> <code>{safe_id}</code> &nbsp;|&nbsp;
-                    <strong>Confidence:</strong> <code>{safe_score}</code>
+                    <strong>Relevance:</strong> <code>{safe_score}</code>
                 </div>
                 <div>"{safe_snippet}"</div>
             </div>
@@ -191,8 +197,7 @@ def rewrite_followup_query(llm: ChatGroq, query: str, history: List[Dict[str, An
         f"Conversation:\n{conv_text}\n\nFollow-up: {query}"
     )
     try:
-        rewritten = strip_think_tags(llm.invoke(prompt).content)
-        return rewritten if rewritten else query
+        return strip_think_tags(llm.invoke(prompt).content)
     except Exception:
         return query
 
@@ -223,7 +228,6 @@ with st.sidebar:
         )
         if entered_key:
             st.session_state.user_groq_key = entered_key.strip()
-            os.environ["GROQ_API_KEY"] = entered_key.strip()
             groq_api_key = entered_key.strip()
         else:
             st.warning("Add `GROQ_API_KEY` in Streamlit Secrets (or paste above) to enable LLM answers.")
@@ -250,13 +254,13 @@ with st.sidebar:
     top_k = st.slider("Candidates to Retrieve (Top-K)", 2, 12, 6)
     context_k = st.slider("Context Chunks Sent to LLM", 1, 8, 4)
     use_reranker = st.toggle("Cross-Encoder Re-Ranking", value=True)
-    confidence_threshold = st.slider(
-        "Min Confidence Threshold (%)",
+    relevance_threshold = st.slider(
+        "Min Relevance Score (%)",
         min_value=5,
         max_value=80,
         value=25,
         step=5,
-        help="Chunks below this Cross-Encoder probability are treated as irrelevant.",
+        help="Chunks below this Cross-Encoder relevance score are treated as irrelevant.",
     ) / 100.0
     use_hyde = st.toggle("HyDE (Query Expansion)", value=False)
     strict_mode = st.toggle(
@@ -287,10 +291,9 @@ with st.sidebar:
                     embed_model = get_embedding_model()
                     combined_chunks = st.session_state.all_documents + new_chunks
                     combined_files = st.session_state.indexed_files + newly_indexed
-                    faiss_db, bm25_ret, ensemble = build_or_update_index(
+                    faiss_db, bm25_ret = build_or_update_index(
                         chunks=combined_chunks,
                         embed_model=embed_model,
-                        dense_weight=dense_weight,
                         existing_faiss=st.session_state.faiss_store,
                         new_chunks=new_chunks,
                     )
@@ -298,13 +301,13 @@ with st.sidebar:
                     st.session_state.indexed_files = combined_files
                     st.session_state.faiss_store = faiss_db
                     st.session_state.bm25_retriever = bm25_ret
-                    st.session_state.ensemble_retriever = ensemble
                     save_persisted_state(
                         st.session_state.session_id,
                         faiss_db,
                         combined_chunks,
                         combined_files,
                         dense_weight,
+                        embedding_model=EMBEDDING_MODEL_NAME,
                     )
                     st.success(f"Added {len(new_chunks)} chunks from {len(newly_indexed)} file(s).")
         else:
@@ -320,10 +323,9 @@ with st.sidebar:
                 embed_model = get_embedding_model()
                 combined_chunks = st.session_state.all_documents + sample_chunks
                 combined_files = st.session_state.indexed_files + [demo_name]
-                faiss_db, bm25_ret, ensemble = build_or_update_index(
+                faiss_db, bm25_ret = build_or_update_index(
                     chunks=combined_chunks,
                     embed_model=embed_model,
-                    dense_weight=dense_weight,
                     existing_faiss=st.session_state.faiss_store,
                     new_chunks=sample_chunks,
                 )
@@ -331,13 +333,13 @@ with st.sidebar:
                 st.session_state.indexed_files = combined_files
                 st.session_state.faiss_store = faiss_db
                 st.session_state.bm25_retriever = bm25_ret
-                st.session_state.ensemble_retriever = ensemble
                 save_persisted_state(
                     st.session_state.session_id,
                     faiss_db,
                     combined_chunks,
                     combined_files,
                     dense_weight,
+                    embedding_model=EMBEDDING_MODEL_NAME,
                 )
                 st.success(f"Loaded `{demo_name}` ({len(sample_chunks)} chunks).")
 
@@ -357,23 +359,22 @@ with st.sidebar:
                 st.session_state.indexed_files = remaining_files
                 if remaining_chunks:
                     embed_model = get_embedding_model()
-                    faiss_db, bm25_ret, ensemble = build_or_update_index(
-                        remaining_chunks, embed_model, dense_weight=dense_weight
+                    faiss_db, bm25_ret = build_or_update_index(
+                        remaining_chunks, embed_model
                     )
                     st.session_state.faiss_store = faiss_db
                     st.session_state.bm25_retriever = bm25_ret
-                    st.session_state.ensemble_retriever = ensemble
                     save_persisted_state(
                         st.session_state.session_id,
                         faiss_db,
                         remaining_chunks,
                         remaining_files,
                         dense_weight,
+                        embedding_model=EMBEDDING_MODEL_NAME,
                     )
                 else:
                     st.session_state.faiss_store = None
                     st.session_state.bm25_retriever = None
-                    st.session_state.ensemble_retriever = None
                     clear_persisted_state(st.session_state.session_id)
                 st.rerun()
 
@@ -389,7 +390,6 @@ with st.sidebar:
 
     if st.button("🗑️ Clear All & Reset", use_container_width=True):
         st.session_state.chat_history = []
-        st.session_state.ensemble_retriever = None
         st.session_state.faiss_store = None
         st.session_state.bm25_retriever = None
         st.session_state.all_documents = []
@@ -409,7 +409,9 @@ st.markdown(
 if st.session_state.get("startup_warning"):
     st.warning(st.session_state.startup_warning)
 
-if not st.session_state.ensemble_retriever:
+has_index = st.session_state.faiss_store is not None and st.session_state.bm25_retriever is not None
+
+if not has_index:
     st.info(
         "👈 **No documents indexed yet:** Upload PDF/DOCX/TXT/CSV files or click **'📋 Load Demo Enterprise Doc'** in the sidebar."
     )
@@ -462,11 +464,14 @@ if active_view == "💬 Chat & Q&A":
 
         with assistant_slot:
             try:
+                if not groq_api_key:
+                    raise ValueError("Groq API key is missing. Add it in Streamlit Secrets or the sidebar.")
+
                 t_start = time.time()
-                groq_llm = ChatGroq(model_name=selected_model, temperature=temperature)
+                groq_llm = ChatGroq(model_name=selected_model, temperature=temperature, api_key=groq_api_key)
 
                 # Case A: No documents indexed
-                if not st.session_state.ensemble_retriever:
+                if not has_index:
                     retrieval_ms = 0
                     rerank_ms = 0
                     sources_data = []
@@ -494,25 +499,24 @@ if active_view == "💬 Chat & Q&A":
                     standalone_query = rewrite_followup_query(
                         groq_llm, user_query, st.session_state.chat_history
                     )
-                    search_query = standalone_query
-
+                    dense_query = None
                     if use_hyde:
                         hyde_resp = groq_llm.invoke(
                             f"Write a concise technical passage answering: '{standalone_query}'"
                         )
-                        search_query = strip_think_tags(hyde_resp.content) or standalone_query
+                        dense_query = strip_think_tags(hyde_resp.content)
 
                     t_ret_start = time.time()
                     ret_out = retrieve_and_rerank(
-                        query=search_query,
+                        query=standalone_query,
                         bm25_ret=st.session_state.bm25_retriever,
                         faiss_db=st.session_state.faiss_store,
-                        ensemble=st.session_state.ensemble_retriever,
                         dense_weight=dense_weight,
                         top_k=top_k,
                         context_k=context_k,
                         use_reranker=use_reranker,
                         cross_encoder=get_cross_encoder() if use_reranker else None,
+                        dense_query=dense_query,
                     )
                     retrieval_ms = int((time.time() - t_ret_start) * 1000)
 
@@ -526,16 +530,14 @@ if active_view == "💬 Chat & Q&A":
 
                     t_rerank_start = time.time()
                     scored_chunks = ret_out["scored_chunks"]
-                    # Filter only chunks passing confidence threshold when reranker is ON
                     if use_reranker:
                         relevant_chunks = [
-                            s for s in scored_chunks if s["score"] >= confidence_threshold
+                            s for s in scored_chunks if s["score"] >= relevance_threshold
                         ]
                     else:
                         relevant_chunks = scored_chunks
                     rerank_ms = int((time.time() - t_rerank_start) * 1000)
 
-                    # Off-topic check at retrieval gate
                     t_gen_start = time.time()
                     if not relevant_chunks:
                         sources_data = []
@@ -543,7 +545,7 @@ if active_view == "💬 Chat & Q&A":
                         if strict_mode:
                             answer_content = (
                                 "🔒 **Strict Mode:** Your uploaded documents do not contain relevant information "
-                                "for this query (no chunks met the confidence threshold)."
+                                "for this query (no chunks met the relevance threshold)."
                             )
                             st.markdown(answer_content)
                         else:
@@ -554,7 +556,7 @@ if active_view == "💬 Chat & Q&A":
                             st.markdown(notice)
 
                             def stream_fallback():
-                                for chunk in groq_llm.stream(user_query):
+                                for chunk in groq_llm.stream(standalone_query):
                                     yield chunk.content
 
                             streamed_body = strip_think_tags(st.write_stream(stream_fallback()))
@@ -563,7 +565,7 @@ if active_view == "💬 Chat & Q&A":
                         context_str = ""
                         retrieved_ids = []
                         sources_data = []
-                        for item in relevant_chunks:
+                        for rank_idx, item in enumerate(relevant_chunks, start=1):
                             doc = item["doc"]
                             prob = item["score"]
                             c_id = doc.metadata.get("chunk_id", "Unknown")
@@ -574,7 +576,7 @@ if active_view == "💬 Chat & Q&A":
                                 {
                                     "source": src_name,
                                     "chunk_id": c_id,
-                                    "score": f"{prob * 100:.1f}%" if use_reranker else f"Rank Score {prob:.2f}",
+                                    "score": f"{prob * 100:.1f}%" if item["logit"] is not None else f"Rank #{rank_idx}",
                                     "snippet": doc.page_content[:220]
                                     + ("..." if len(doc.page_content) > 220 else ""),
                                 }
@@ -591,10 +593,10 @@ RETRIEVED CONTEXT:
 {context_str}
 
 USER QUESTION:
-{user_query}
+{standalone_query}
 """
                         raw_resp = strip_think_tags(groq_llm.invoke(grounded_prompt).content)
-                        if raw_resp.strip().startswith("NOT_FOUND"):
+                        if "NOT_FOUND" in raw_resp[:40]:
                             sources_data = []
                             cit_badge = ""
                             if strict_mode:
@@ -608,7 +610,7 @@ USER QUESTION:
                                 st.markdown(notice)
 
                                 def stream_fb2():
-                                    for chunk in groq_llm.stream(user_query):
+                                    for chunk in groq_llm.stream(standalone_query):
                                         yield chunk.content
 
                                 streamed_body = strip_think_tags(st.write_stream(stream_fb2()))
@@ -643,7 +645,6 @@ USER QUESTION:
                     with st.expander(f"🔎 Grounding Sources ({len(sources_data)} relevant chunk(s))"):
                         render_source_cards(sources_data)
 
-                # Save both turns only after successful generation
                 st.session_state.chat_history.append({"role": "user", "content": user_query})
                 st.session_state.chat_history.append(
                     {
@@ -682,7 +683,10 @@ elif active_view == "🔍 Retrieval Inspector":
             st.markdown("#### 🎯 Final Reranked")
             for i, item in enumerate(insp["reranked"][:5], 1):
                 d = item["doc"]
-                st.markdown(f"**#{i}** `{d.metadata.get('chunk_id')}` (`{item['score']*100:.1f}%`)")
+                if item["logit"] is None:
+                    st.markdown(f"**#{i}** `{d.metadata.get('chunk_id')}` (`Rank #{i}`)")
+                else:
+                    st.markdown(f"**#{i}** `{d.metadata.get('chunk_id')}` (`{item['score']*100:.1f}%`)")
                 st.caption(d.page_content[:140] + "...")
 
 # ================= TAB 3: ACCURACY & EVAL =================
@@ -692,18 +696,25 @@ elif active_view == "📊 Accuracy & Eval":
         "Evaluates the pipeline across **7 curated test cases** (5 in-domain technical questions + 2 off-topic rejection checks) "
         "measuring **Retrieval Hit Rate@K**, **MRR**, **Faithfulness**, **Answer Correctness**, and **Off-Topic Rejection**."
     )
-    if st.button("▶️ Run Accuracy Benchmark Now"):
-        with st.spinner("Running 7-case RAG evaluation suite..."):
-            results = run_evaluation(
-                embed_model=get_embedding_model(),
-                cross_encoder=get_cross_encoder(),
-                model_name=selected_model,
-                dense_weight=dense_weight,
-                top_k=top_k,
-                context_k=context_k,
-                confidence_threshold=confidence_threshold,
-            )
-            st.session_state.eval_results = results
+    eval_enabled = os.getenv("VERIDOC_ENABLE_EVAL", "").strip() == "1"
+    if not eval_enabled:
+        st.info("Evaluation runner is disabled in this environment (set `VERIDOC_ENABLE_EVAL=1` to enable).")
+    elif st.button("▶️ Run Accuracy Benchmark Now"):
+        if not groq_api_key:
+            st.error("Groq API key is missing. Add it in `.env`, Streamlit Secrets, or the sidebar.")
+        else:
+            with st.spinner("Running 7-case RAG evaluation suite..."):
+                results = run_evaluation(
+                    embed_model=get_embedding_model(),
+                    cross_encoder=get_cross_encoder(),
+                    model_name=selected_model,
+                    dense_weight=dense_weight,
+                    top_k=top_k,
+                    context_k=context_k,
+                    relevance_threshold=relevance_threshold,
+                    api_key=groq_api_key,
+                )
+                st.session_state.eval_results = results
 
     if st.session_state.eval_results:
         res = st.session_state.eval_results

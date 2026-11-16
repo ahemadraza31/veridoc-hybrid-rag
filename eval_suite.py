@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import List, Dict, Any
 from langchain_groq import ChatGroq
@@ -59,21 +60,24 @@ def run_evaluation(
     dense_weight: float = 0.5,
     top_k: int = 6,
     context_k: int = 4,
-    confidence_threshold: float = 0.25,
+    relevance_threshold: float = 0.25,
+    api_key: str = "",
 ) -> Dict[str, Any]:
     """
     Runs the full RAG accuracy benchmark on the sample enterprise document.
     Returns summary metrics and per-question results.
     """
     chunks = get_sample_document()
-    faiss_db, bm25_ret, ensemble = build_or_update_index(chunks, embed_model, dense_weight=dense_weight)
-    llm = ChatGroq(model_name=model_name, temperature=0.0)
+    faiss_db, bm25_ret = build_or_update_index(chunks, embed_model)
+    resolved_key = api_key or os.getenv("GROQ_API_KEY", "")
+    llm = ChatGroq(model_name=model_name, temperature=0.0, api_key=resolved_key)
 
     in_domain_total = 0
     hits = 0
     mrr_sum = 0.0
     faithfulness_scores: List[float] = []
     correctness_scores: List[float] = []
+    judge_fallbacks = 0
 
     off_topic_total = 0
     off_topic_rejected = 0
@@ -89,7 +93,6 @@ def run_evaluation(
             query=q,
             bm25_ret=bm25_ret,
             faiss_db=faiss_db,
-            ensemble=ensemble,
             dense_weight=dense_weight,
             top_k=top_k,
             context_k=context_k,
@@ -101,7 +104,7 @@ def run_evaluation(
 
         if is_off:
             off_topic_total += 1
-            rejected = top_prob < confidence_threshold
+            rejected = top_prob < relevance_threshold
             if not rejected:
                 # Check if LLM returns NOT_FOUND sentinel
                 ctx = "\n".join([s["doc"].page_content for s in scored])
@@ -110,14 +113,14 @@ def run_evaluation(
                         f"If the context does not answer the question, output ONLY 'NOT_FOUND'.\nContext:\n{ctx}\nQuestion: {q}"
                     ).content
                 )
-                rejected = "NOT_FOUND" in ans
+                rejected = "NOT_FOUND" in ans[:40]
             if rejected:
                 off_topic_rejected += 1
             details.append({
                 "question": q,
                 "type": "Off-Topic",
                 "hit": "N/A",
-                "top_confidence": f"{top_prob * 100:.1f}%",
+                "top_relevance": f"{top_prob * 100:.1f}%",
                 "faithfulness": "N/A",
                 "correctness": "100%" if rejected else "0% (False Positive)",
             })
@@ -158,14 +161,18 @@ Generated Answer:
 """
         judge_raw = strip_think_tags(llm.invoke(judge_prompt).content)
         f_score, c_score = 80.0, 80.0
+        parsed_ok = False
         match = re.search(r"\{.*\}", judge_raw, flags=re.DOTALL)
         if match:
             try:
                 parsed = json.loads(match.group(0))
                 f_score = float(parsed.get("faithfulness", 80))
                 c_score = float(parsed.get("correctness", 80))
+                parsed_ok = True
             except Exception:
                 pass
+        if not parsed_ok:
+            judge_fallbacks += 1
 
         faithfulness_scores.append(f_score)
         correctness_scores.append(c_score)
@@ -174,7 +181,7 @@ Generated Answer:
             "question": q,
             "type": "In-Domain",
             "hit": f"Rank #{hit_rank}" if hit_rank > 0 else "Miss",
-            "top_confidence": f"{top_prob * 100:.1f}%",
+            "top_relevance": f"{top_prob * 100:.1f}%",
             "faithfulness": f"{f_score:.0f}%",
             "correctness": f"{c_score:.0f}%",
         })
@@ -185,5 +192,6 @@ Generated Answer:
         "avg_faithfulness": (sum(faithfulness_scores) / len(faithfulness_scores)) if faithfulness_scores else 0.0,
         "avg_correctness": (sum(correctness_scores) / len(correctness_scores)) if correctness_scores else 0.0,
         "off_topic_rejection": (off_topic_rejected / off_topic_total * 100) if off_topic_total else 0.0,
+        "judge_fallbacks": judge_fallbacks,
         "details": details,
     }
