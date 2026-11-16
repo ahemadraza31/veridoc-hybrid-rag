@@ -424,34 +424,43 @@ else:
         unsafe_allow_html=True,
     )
 
-tab_chat, tab_inspect, tab_eval = st.tabs(
-    ["💬 Chat & Q&A", "🔍 Retrieval Inspector", "📊 Accuracy & Eval"]
+active_view = st.radio(
+    "Navigation",
+    ["💬 Chat & Q&A", "🔍 Retrieval Inspector", "📊 Accuracy & Eval"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
+st.divider()
 
 # ================= TAB 1: CHAT & Q&A =================
-with tab_chat:
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if "metrics" in message:
-                m = message["metrics"]
-                cit_info = message.get("citation_check", "")
-                st.caption(
-                    f"⏱️ Retrieval: {m.get('retrieval_ms', 0)}ms | Rerank: {m.get('rerank_ms', 0)}ms | "
-                    f"Gen: {m.get('gen_ms', 0)}ms | Total: {m.get('total_ms', 0)}ms"
-                    + (f" | {cit_info}" if cit_info else "")
-                )
-            if message.get("sources"):
-                with st.expander(f"🔎 Grounding Sources ({len(message['sources'])} relevant chunk(s))"):
-                    render_source_cards(message["sources"])
+if active_view == "💬 Chat & Q&A":
+    chat_container = st.container()
+    with chat_container:
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                if "metrics" in message:
+                    m = message["metrics"]
+                    cit_info = message.get("citation_check", "")
+                    st.caption(
+                        f"⏱️ Retrieval: {m.get('retrieval_ms', 0)}ms | Rerank: {m.get('rerank_ms', 0)}ms | "
+                        f"Gen: {m.get('gen_ms', 0)}ms | Total: {m.get('total_ms', 0)}ms"
+                        + (f" | {cit_info}" if cit_info else "")
+                    )
+                if message.get("sources"):
+                    with st.expander(f"🔎 Grounding Sources ({len(message['sources'])} relevant chunk(s))"):
+                        render_source_cards(message["sources"])
 
+    # Root-level chat_input stays pinned at the bottom below all chat messages
     user_query = st.chat_input("Ask a question about your documents...")
 
     if user_query:
-        with st.chat_message("user"):
-            st.markdown(user_query)
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(user_query)
+            assistant_slot = st.chat_message("assistant")
 
-        with st.chat_message("assistant"):
+        with assistant_slot:
             try:
                 t_start = time.time()
                 groq_llm = ChatGroq(model_name=selected_model, temperature=temperature)
@@ -651,7 +660,7 @@ USER QUESTION:
                 st.error(f"Error during query execution: {e}")
 
 # ================= TAB 2: RETRIEVAL INSPECTOR =================
-with tab_inspect:
+elif active_view == "🔍 Retrieval Inspector":
     st.markdown("### 🔍 Hybrid Retrieval Inspector (BM25 vs FAISS vs Cross-Encoder)")
     insp = st.session_state.get("last_inspection")
     if not insp:
@@ -677,7 +686,7 @@ with tab_inspect:
                 st.caption(d.page_content[:140] + "...")
 
 # ================= TAB 3: ACCURACY & EVAL =================
-with tab_eval:
+elif active_view == "📊 Accuracy & Eval":
     st.markdown("### 📊 Automated RAG Accuracy Benchmark")
     st.write(
         "Evaluates the pipeline across **7 curated test cases** (5 in-domain technical questions + 2 off-topic rejection checks) "
