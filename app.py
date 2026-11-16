@@ -37,21 +37,25 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# API Key Resolution (env + st.secrets for Streamlit Community Cloud)
-groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
-if not groq_api_key:
+# API Key Resolution (env + st.secrets top-level or nested + sidebar fallback)
+def _resolve_groq_key() -> str:
+    env_key = os.getenv("GROQ_API_KEY", "").strip()
+    if env_key:
+        return env_key
     try:
         if "GROQ_API_KEY" in st.secrets:
-            groq_api_key = str(st.secrets["GROQ_API_KEY"]).strip()
-            os.environ["GROQ_API_KEY"] = groq_api_key
+            return str(st.secrets["GROQ_API_KEY"]).strip()
+        for val in st.secrets.values():
+            if isinstance(val, dict) and "GROQ_API_KEY" in val:
+                return str(val["GROQ_API_KEY"]).strip()
     except Exception:
         pass
+    return st.session_state.get("user_groq_key", "").strip()
 
-if not groq_api_key:
-    st.error(
-        "Missing `GROQ_API_KEY`. Add it to `.env` locally or in Streamlit Cloud **App Settings -> Secrets**."
-    )
-    st.stop()
+
+groq_api_key = _resolve_groq_key()
+if groq_api_key:
+    os.environ["GROQ_API_KEY"] = groq_api_key
 
 # Theme-safe Custom Styling (works in both Light & Dark themes)
 st.markdown(
@@ -209,6 +213,20 @@ def export_chat_markdown(history: List[Dict[str, Any]]) -> str:
 # ----------------- SIDEBAR CONTROLS -----------------
 with st.sidebar:
     st.markdown("### ⚙️ Pipeline Configuration")
+
+    if not groq_api_key:
+        entered_key = st.text_input(
+            "Groq API Key",
+            type="password",
+            placeholder="gsk_...",
+            help="Set GROQ_API_KEY in Streamlit Secrets or paste one here for this session.",
+        )
+        if entered_key:
+            st.session_state.user_groq_key = entered_key.strip()
+            os.environ["GROQ_API_KEY"] = entered_key.strip()
+            groq_api_key = entered_key.strip()
+        else:
+            st.warning("Add `GROQ_API_KEY` in Streamlit Secrets (or paste above) to enable LLM answers.")
 
     selected_model = st.selectbox(
         "Inference LLM (Groq)",

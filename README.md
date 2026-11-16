@@ -2,7 +2,7 @@
 
 **VeriDoc AI** is a production-grade Retrieval-Augmented Generation (RAG) engine built for multi-document enterprise knowledge retrieval. It combines **Dense Vector Search (FAISS)**, **Sparse Lexical Search (BM25)**, **MS-MARCO Cross-Encoder Re-Ranking**, **Conversational Query Rewriting**, and **Strict Citation Validation** inside an interactive **Streamlit** dashboard.
 
-> 🚀 **Live Demo:** *(Add your Streamlit Community Cloud URL here after deployment)*
+> 🚀 **Live Demo:** **[veridoc-rag-ahemad.streamlit.app](https://veridoc-rag-ahemad.streamlit.app/)**
 
 ---
 
