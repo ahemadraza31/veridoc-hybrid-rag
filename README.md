@@ -119,21 +119,23 @@ Every question can be rewritten into a standalone query from recent conversation
 
 ## 10-Case Smoke Test
 
-Evaluated across **3 runs** on `ACME_Enterprise_Arch_2026.pdf` via `eval_suite.py` with **`qwen/qwen3.8-27b`** as the generator and a separate **`openai/gpt-oss-120b`** model as the LLM-as-a-Judge (`temperature=0.0`):
+Evaluated across **3 runs** on `ACME_Enterprise_Arch_2026.pdf` via `eval_suite.py` using the shared production prompt (`build_grounded_prompt` in `prompts.py`) with **`qwen/qwen3.8-27b`** as the generator and a separate **`openai/gpt-oss-120b`** model as the LLM-as-a-Judge (`temperature=0.0`):
 
 - **Dataset split:** **5 In-Domain** technical questions + **5 Off-Topic** questions (**2** general + **3** near-domain enterprise/ACME questions about 2025 revenue/EBITDA, SLA breach refund policy, and cloud migration budget/quarter).
-- **Judge & fallback behavior:** `openai/gpt-oss-120b` scores faithfulness and correctness in JSON (`judge_fallbacks` tracks parse failures defaulting to `80.0`). Across all 3 runs, fallbacks were **`0 of 15 judge calls`** (`0 of 5` per run).
+- **Judge rubric & fallback behavior:** `openai/gpt-oss-120b` returns JSON scores with a one-sentence rationale per metric. The rubric separates **faithfulness** (scores only whether every claim in the answer is supported by retrieved context—brevity or omitted details do not lower it) from **correctness** (completeness and accuracy against `expected_answer`). `judge_fallbacks` tracks JSON parse failures defaulting to `80.0`; across all 3 runs, fallbacks were **`0 of 15 judge calls`** (`0 of 5` per run).
 - **How each metric is scored:**
   - **Hit Rate@K & MRR:** Case-insensitive **string match** checking whether `expected_keyword` appears in `doc.page_content` of the top reranked chunks.
   - **Faithfulness & Answer Correctness:** Separate **LLM-as-a-Judge** (`openai/gpt-oss-120b`) scoring `0–100` in JSON (`faithfulness` vs. retrieved context; `correctness` vs. `expected_answer`).
   - **Off-Topic Rejection:** Passes if top Cross-Encoder relevance score is below threshold (`25%`), or if the generator outputs the `NOT_FOUND` sentinel.
 
+Because LLM generation and judging vary slightly between runs, results below report both the 3-run mean and min–max range:
+
 | Metric | 3-Run Mean | 3-Run Range | Notes |
 | :--- | :---: | :---: | :--- |
 | **Retrieval Hit Rate@K** | **100.0%** | `100.0%–100.0%` | 5/5 in-domain queries matched `expected_keyword` at **Rank #1** |
 | **Mean Reciprocal Rank (MRR)** | **1.00** | `1.00–1.00` | Top-ranked chunk hit on every in-domain case |
-| **Faithfulness** | **95.5%** | `86.6%–100.0%` | Runs scored `100.0%`, `86.6%`, `100.0%` |
-| **Answer Correctness** | **69.1%** | `67.6%–71.0%` | Lower because `expected_answer` bundles extra section facts while the generator prompt asks to be concise |
+| **Faithfulness** | **100.0%** | `100.0%–100.0%` | All claims across 15 in-domain answers were supported by retrieved context |
+| **Answer Correctness** | **81.5%** | `80.6%–83.0%` | Runs scored `83.0%`, `81.0%`, `80.6%`; cases 4 and 5 omit secondary section details not requested by the question |
 | **Off-Topic Gate Only** | **60.0% (3/5)** | `60.0%–60.0%` | 2 general (`0.0%`) + 1 near-domain refund (`6.8%`) passed the `25%` gate |
 | **Off-Topic Rejection (End-to-End)** | **100.0% (5/5)** | `100.0%–100.0%` | All 5 off-topic queries were rejected across all 3 runs |
 
@@ -148,6 +150,7 @@ Cross-encoder relevance measures topical similarity, not answerability, so the L
 ## Project Structure
 
 - `app.py` — Streamlit UI, sidebar controls, session initialization, query routing, and views
+- `prompts.py` — Shared grounded Q&A prompt builder (`build_grounded_prompt`) used by both `app.py` and `eval_suite.py`
 - `ingest.py` — Multi-format parsing (`.pdf`, `.docx`, `.txt`, `.csv`), chunking, deduplication, and demo doc
 - `retrieval.py` — Normalized `FAISS` + regex `BM25`, weighted RRF fusion (`c=60`), sigmoid Cross-Encoder reranking, and citation checks
 - `storage.py` — Validated session-namespaced atomic persistence (`.veridoc_storage/<sid>/`), integrity checks, and 7-day purge

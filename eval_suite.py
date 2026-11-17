@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from ingest import get_sample_document
+from prompts import build_grounded_prompt
 from retrieval import build_or_update_index, retrieve_and_rerank, strip_think_tags
 
 GENERATOR_MODEL = "qwen/qwen3.8-27b"
@@ -85,6 +86,109 @@ EVAL_DATASET: List[Dict[str, Any]] = [
 ]
 
 
+def _build_judge_prompt(context_str: str, expected_answer: str, generated_answer: str) -> str:
+    return f"""Evaluate the Generated Answer using two separate 0-100 scores and return ONLY valid JSON:
+{{"faithfulness": <int 0-100>, "correctness": <int 0-100>, "rationale": "<one sentence for faithfulness; one sentence for correctness>"}}
+
+Rubric:
+- faithfulness: Score ONLY whether every claim and citation in the Generated Answer is directly supported by the Context. Lower this score ONLY for unsupported or contradicted claims. Brevity or omitting details present in Context or Expected Answer MUST NOT lower faithfulness.
+- correctness: Score factual accuracy and completeness compared against the Expected Answer.
+
+Context:
+{context_str}
+
+Expected Answer:
+{expected_answer}
+
+Generated Answer:
+{generated_answer}
+"""
+
+
+def _evaluate_with_judge(
+    judge_llm: ChatGroq, context_str: str, expected_answer: str, generated_answer: str
+):
+    judge_prompt = _build_judge_prompt(context_str, expected_answer, generated_answer)
+    judge_raw = strip_think_tags(judge_llm.invoke(judge_prompt).content)
+    f_score, c_score = 80.0, 80.0
+    rationale = "Fallback to default 80.0 due to JSON parse error."
+    parsed_ok = False
+    match = re.search(r"\{.*\}", judge_raw, flags=re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            f_score = float(parsed.get("faithfulness", 80))
+            c_score = float(parsed.get("correctness", 80))
+            rationale = str(parsed.get("rationale", "")).strip() or "No rationale returned."
+            parsed_ok = True
+        except Exception:
+            pass
+    return f_score, c_score, rationale, parsed_ok
+
+
+def run_judge_sanity_check(
+    embed_model,
+    cross_encoder,
+    model_name: str = GENERATOR_MODEL,
+    judge_model: str = JUDGE_MODEL,
+    dense_weight: float = 0.5,
+    top_k: int = 6,
+    context_k: int = 4,
+    api_key: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Sanity-check the faithfulness judge on 2 in-domain cases by appending a fabricated claim
+    to the real generated answer over the real retrieved context.
+    """
+    chunks = get_sample_document()
+    faiss_db, bm25_ret = build_or_update_index(chunks, embed_model)
+    resolved_key = api_key or os.getenv("GROQ_API_KEY", "")
+    llm = ChatGroq(model_name=model_name, temperature=0.0, api_key=resolved_key)
+    judge_llm = ChatGroq(model_name=judge_model, temperature=0.0, api_key=resolved_key)
+
+    fabricated_claims = [
+        "- Access tokens may also be extended to a 90-day TTL for legacy enterprise clients.",
+        "- Internal backup archives use Blowfish-128 encryption over unencrypted FTP.",
+    ]
+
+    results = []
+    for item, fake_claim in zip(EVAL_DATASET[:2], fabricated_claims):
+        q = item["question"]
+        res = retrieve_and_rerank(
+            query=q,
+            bm25_ret=bm25_ret,
+            faiss_db=faiss_db,
+            dense_weight=dense_weight,
+            top_k=top_k,
+            context_k=context_k,
+            use_reranker=True,
+            cross_encoder=cross_encoder,
+        )
+        scored = res["scored_chunks"]
+        context_str = "\n".join(
+            [
+                f"\n--- [Source: {s['doc'].metadata.get('source_name', 'Document')} | ID: {s['doc'].metadata.get('chunk_id')}] ---\n{s['doc'].page_content}\n"
+                for s in scored
+            ]
+        )
+        real_ans = strip_think_tags(
+            llm.invoke(build_grounded_prompt(context_str, q)).content
+        )
+        poisoned_ans = f"{real_ans}\n{fake_claim}"
+        f_score, c_score, rationale, parsed_ok = _evaluate_with_judge(
+            judge_llm, context_str, item["expected_answer"], poisoned_ans
+        )
+        results.append({
+            "question": q,
+            "fabricated_claim": fake_claim,
+            "faithfulness": f_score,
+            "correctness": c_score,
+            "rationale": rationale,
+            "parsed_ok": parsed_ok,
+        })
+    return results
+
+
 def run_evaluation(
     embed_model,
     cross_encoder,
@@ -146,11 +250,11 @@ def run_evaluation(
                 rejected = True
                 rejection_stage = "Threshold Gate"
             else:
-                ctx = "\n".join([s["doc"].page_content for s in scored])
+                ctx = "\n".join(
+                    [f"[Source: {s['doc'].metadata.get('source_name', 'Document')} | ID: {s['doc'].metadata.get('chunk_id')}]\n{s['doc'].page_content}" for s in scored]
+                )
                 ans = strip_think_tags(
-                    llm.invoke(
-                        f"If the context does not answer the question, output ONLY 'NOT_FOUND'.\nContext:\n{ctx}\nQuestion: {q}"
-                    ).content
+                    llm.invoke(build_grounded_prompt(ctx, q)).content
                 )
                 rejected = "NOT_FOUND" in ans[:40]
                 rejection_stage = "NOT_FOUND Sentinel (Gate Missed)" if rejected else "FAILED"
@@ -164,10 +268,11 @@ def run_evaluation(
                 "top_relevance": f"{top_prob * 100:.1f}%",
                 "faithfulness": "N/A",
                 "correctness": f"100% ({rejection_stage})" if rejected else "0% (False Positive)",
+                "rationale": rejection_stage,
             })
             continue
 
-        # In-domain evaluation
+        # In-domain evaluation using the shared production grounded prompt
         in_domain_total += 1
         hit_rank = 0
         for idx, s in enumerate(scored, start=1):
@@ -179,39 +284,19 @@ def run_evaluation(
             mrr_sum += 1.0 / hit_rank
 
         context_str = "\n".join(
-            [f"[{s['doc'].metadata.get('chunk_id')}] {s['doc'].page_content}" for s in scored]
+            [
+                f"\n--- [Source: {s['doc'].metadata.get('source_name', 'Document')} | ID: {s['doc'].metadata.get('chunk_id')}] ---\n{s['doc'].page_content}\n"
+                for s in scored
+            ]
         )
         gen_ans = strip_think_tags(
-            llm.invoke(
-                f"Answer strictly from the context below. Be concise.\n\nContext:\n{context_str}\n\nQuestion: {q}"
-            ).content
+            llm.invoke(build_grounded_prompt(context_str, q)).content
         )
 
-        # Separate Judge LLM for Faithfulness & Correctness
-        judge_prompt = f"""Score the generated answer on two 0-100 scales and return ONLY valid JSON:
-{{"faithfulness": <int 0-100, 100 if every claim is supported by Context>, "correctness": <int 0-100, factual match with Expected Answer>}}
-
-Context:
-{context_str}
-
-Expected Answer:
-{item['expected_answer']}
-
-Generated Answer:
-{gen_ans}
-"""
-        judge_raw = strip_think_tags(judge_llm.invoke(judge_prompt).content)
-        f_score, c_score = 80.0, 80.0
-        parsed_ok = False
-        match = re.search(r"\{.*\}", judge_raw, flags=re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                f_score = float(parsed.get("faithfulness", 80))
-                c_score = float(parsed.get("correctness", 80))
-                parsed_ok = True
-            except Exception:
-                pass
+        # Separate Judge LLM with separated Faithfulness vs Correctness rubric
+        f_score, c_score, rationale, parsed_ok = _evaluate_with_judge(
+            judge_llm, context_str, item["expected_answer"], gen_ans
+        )
         if not parsed_ok:
             judge_fallbacks += 1
 
@@ -225,6 +310,7 @@ Generated Answer:
             "top_relevance": f"{top_prob * 100:.1f}%",
             "faithfulness": f"{f_score:.0f}%",
             "correctness": f"{c_score:.0f}%",
+            "rationale": rationale,
         })
 
     return {
@@ -258,12 +344,23 @@ if __name__ == "__main__":
         res = run_evaluation(emb, ce, model_name=GENERATOR_MODEL, judge_model=JUDGE_MODEL)
         runs.append(res)
         print(
-            f"Run {run_idx} | Gen={res['generator_model']} | Judge={res['judge_model']} | "
-            f"Hit={res['hit_rate']:.1f}% | MRR={res['mrr']:.2f} | "
+            f"\n=== Run {run_idx} | Gen={res['generator_model']} | Judge={res['judge_model']} ==="
+        )
+        print(
+            f"Summary: Hit={res['hit_rate']:.1f}% | MRR={res['mrr']:.2f} | "
             f"Faith={res['avg_faithfulness']:.1f}% | Corr={res['avg_correctness']:.1f}% | "
             f"OffTopic={res['off_topic_rejection']:.1f}% (Gate={res['threshold_gate_rejection']:.1f}%) | "
             f"Fallbacks={res['judge_fallbacks']} of {res['judge_calls']}"
         )
+        for idx, d in enumerate(res["details"], start=1):
+            print(
+                f"  [{idx}] ({d['type']}) {d['question']} -> "
+                f"Hit={d['hit']} | Rel={d['top_relevance']} | Faith={d['faithfulness']} | Corr={d['correctness']}"
+            )
+            if d["type"] == "In-Domain" and (
+                int(d["faithfulness"].rstrip("%")) < 100 or int(d["correctness"].rstrip("%")) < 100
+            ):
+                print(f"      Rationale (<100): {d['rationale']}")
 
     print("\n--- 3-Run Summary (Mean & Range) ---")
     for key, label, suffix in [
@@ -271,7 +368,7 @@ if __name__ == "__main__":
         ("mrr", "MRR", ""),
         ("avg_faithfulness", "Faithfulness", "%"),
         ("avg_correctness", "Correctness", "%"),
-        ("off_topic_rejection", "Off-Topic Rejection (Total)", "%"),
+        ("off_topic_rejection", "Off-Topic Rejection (End-to-End)", "%"),
         ("threshold_gate_rejection", "Off-Topic Gate Only", "%"),
     ]:
         vals = [r[key] for r in runs]
@@ -279,6 +376,13 @@ if __name__ == "__main__":
     total_fb = sum(r["judge_fallbacks"] for r in runs)
     total_jc = sum(r["judge_calls"] for r in runs)
     print(f"Total Judge Fallbacks: {total_fb} of {total_jc} judge calls")
-    print("\n--- Per-Case Breakdown (Run 3) ---")
-    for d in runs[-1]["details"]:
-        print(d)
+
+    print("\n--- Judge Sanity Check (Fabricated Claims) ---")
+    sanity = run_judge_sanity_check(emb, ce, model_name=GENERATOR_MODEL, judge_model=JUDGE_MODEL)
+    for idx, s in enumerate(sanity, start=1):
+        print(
+            f"  [Sanity {idx}] {s['question']}\n"
+            f"    Fabricated: {s['fabricated_claim']}\n"
+            f"    Faithfulness={s['faithfulness']:.0f}% | Correctness={s['correctness']:.0f}% | Below100={s['faithfulness'] < 100}\n"
+            f"    Rationale: {s['rationale']}"
+        )

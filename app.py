@@ -26,6 +26,7 @@ from storage import (
     purge_old_sessions,
 )
 from eval_suite import run_evaluation
+from prompts import build_grounded_prompt
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
@@ -620,19 +621,7 @@ if active_view == "💬 Chat & Q&A":
                                 }
                             )
 
-                        grounded_prompt = f"""You are VeriDoc AI, an enterprise intelligence assistant.
-Answer the USER QUESTION using ONLY the RETRIEVED CONTEXT below.
-
-Rules:
-1. If the RETRIEVED CONTEXT does not contain enough information to answer the question, output ONLY the exact token: NOT_FOUND
-2. Otherwise, answer clearly using bullet points and bold highlights, and cite facts inline using `[Source: <filename>, ID: <chunk_id>]`.
-
-RETRIEVED CONTEXT:
-{context_str}
-
-USER QUESTION:
-{standalone_query}
-"""
+                        grounded_prompt = build_grounded_prompt(context_str, standalone_query)
                         raw_resp = strip_think_tags(groq_llm.invoke(grounded_prompt).content)
                         if "NOT_FOUND" in raw_resp[:40]:
                             sources_data = []
