@@ -117,6 +117,11 @@ def get_cross_encoder():
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
+@st.cache_resource
+def _run_startup_purge() -> int:
+    return purge_old_sessions(max_age_days=7)
+
+
 # ----------------- SESSION INITIALIZATION -----------------
 if "session_id" not in st.session_state:
     raw_sid = str(st.query_params.get("sid", "")).strip()
@@ -127,9 +132,9 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = valid_sid
     st.query_params["sid"] = valid_sid
 
-if "initialized" not in st.session_state:
-    purge_old_sessions(max_age_days=7)
+_run_startup_purge()
 
+if "initialized" not in st.session_state:
     st.session_state.chat_history = []
     st.session_state.faiss_store = None
     st.session_state.bm25_retriever = None
@@ -624,7 +629,7 @@ USER QUESTION:
                             elif valid_cits:
                                 cit_badge = f"✅ {len(valid_cits)} citation(s) verified"
                             else:
-                                cit_badge = "ℹ️ Grounded in retrieved context"
+                                cit_badge = "ℹ️ No citations found in answer"
 
                     gen_ms = int((time.time() - t_gen_start) * 1000)
 
@@ -693,7 +698,7 @@ elif active_view == "🔍 Retrieval Inspector":
 elif active_view == "📊 Accuracy & Eval":
     st.markdown("### 📊 Automated RAG Accuracy Benchmark")
     st.write(
-        "Evaluates the pipeline across **7 curated test cases** (5 in-domain technical questions + 2 off-topic rejection checks) "
+        "Evaluates the pipeline across **10 curated test cases** (5 in-domain technical questions + 5 off-topic rejection checks: 2 general + 3 near-domain) "
         "measuring **Retrieval Hit Rate@K**, **MRR**, **Faithfulness**, **Answer Correctness**, and **Off-Topic Rejection**."
     )
     eval_enabled = os.getenv("VERIDOC_ENABLE_EVAL", "").strip() == "1"
@@ -703,7 +708,7 @@ elif active_view == "📊 Accuracy & Eval":
         if not groq_api_key:
             st.error("Groq API key is missing. Add it in `.env`, Streamlit Secrets, or the sidebar.")
         else:
-            with st.spinner("Running 7-case RAG evaluation suite..."):
+            with st.spinner("Running 10-case RAG evaluation suite..."):
                 results = run_evaluation(
                     embed_model=get_embedding_model(),
                     cross_encoder=get_cross_encoder(),

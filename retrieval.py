@@ -28,6 +28,13 @@ def strip_think_tags(text: str) -> str:
     return cleaned
 
 
+def _doc_key(doc: Document) -> Tuple[str, str]:
+    cid = doc.metadata.get("chunk_id")
+    if cid:
+        return ("id", str(cid))
+    return ("content", doc.page_content)
+
+
 def weighted_rrf(
     bm25_docs: List[Document],
     faiss_docs: List[Document],
@@ -40,12 +47,12 @@ def weighted_rrf(
     doc_map: Dict[Tuple[str, str], Document] = {}
 
     for rank, doc in enumerate(bm25_docs, start=1):
-        key = (str(doc.metadata.get("chunk_id", "")), doc.page_content)
+        key = _doc_key(doc)
         doc_map[key] = doc
         scores[key] = scores.get(key, 0.0) + sparse_weight / (c + rank)
 
     for rank, doc in enumerate(faiss_docs, start=1):
-        key = (str(doc.metadata.get("chunk_id", "")), doc.page_content)
+        key = _doc_key(doc)
         doc_map[key] = doc
         scores[key] = scores.get(key, 0.0) + dense_weight / (c + rank)
 

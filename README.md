@@ -109,6 +109,7 @@ Every question can be rewritten into a standalone query from recent conversation
 - **Why a two-stage re-ranker:** First-stage retrieval pulls `top_k` candidates per retriever (`2–12`, default `6`), then `cross-encoder/ms-marco-MiniLM-L-6-v2` jointly scores those fused candidates on the standalone query and keeps the top `context_k` chunks (`1–8`, default `4`); optional `HyDE` alters only the dense `FAISS` query.
 - **How fusion works:** A local weighted Reciprocal Rank Fusion function (`weighted_rrf` in `retrieval.py`, `c=60`) merges the `BM25` and `FAISS` lists already retrieved in one pass, weighted by `dense_weight` (`0.0–1.0`, default `0.5`).
 - **How the relevance score is computed:** The `0–100%` relevance score is a `sigmoid` of raw Cross-Encoder logits (`1 / (1 + exp(-logit))`), not a calibrated probability; the default cutoff (`25%` / `0.25`, tunable `5%–80%`) was tuned empirically in `app.py` and `eval_suite.py` rather than via a statistical calibration script.
+- **Why two off-topic layers are needed:** Cross-encoder relevance measures topical similarity, not answerability, so near-domain questions can score high on shared entity/topic words and still require the LLM `NOT_FOUND` check as a second layer.
 - **Chunking & history choices:** Uploaded files use `RecursiveCharacterTextSplitter` with `chunk_size=750`, `chunk_overlap=150`, and `["\n\n", "\n", " ", ""]` separators (`420` / `50` for the shorter built-in demo doc), while follow-up rewrites use the last `4` chat turns (capped at `250` chars each).
 - **Why Groq & tag handling:** `ChatGroq` runs `qwen/qwen3.8-27b` (default), `openai/gpt-oss-120b`, or `openai/gpt-oss-20b` at default `temperature=0.1` (`0.0–0.7`) using explicit `api_key=...` (never mutating `os.environ`); `strip_think_tags` strips both closed and unclosed `<think>` blocks and raises an error if empty afterward, while `NOT_FOUND` is checked within the first `40` characters.
 - **How citations & sessions are checked:** `validate_citations` extracts chunk IDs with `r"ID:\s*([^\],\n]+)"` from `[Source: ..., ID: ...]` tags; session IDs are restricted to `[0-9a-f]{8,32}` in `?sid=`, persisted atomically via temp file + `os.replace`, verified against `index.ntotal` and `embedding_model` on load, and purged after `7` days.
@@ -133,8 +134,10 @@ Evaluated across **3 runs** on `ACME_Enterprise_Arch_2026.pdf` via `eval_suite.p
 | **Mean Reciprocal Rank (MRR)** | **1.00** | `1.00–1.00` | Top-ranked chunk hit on every in-domain case |
 | **Faithfulness** | **95.5%** | `86.6%–100.0%` | Runs scored `100.0%`, `86.6%`, `100.0%` |
 | **Answer Correctness** | **69.1%** | `67.6%–71.0%` | Lower because `expected_answer` bundles extra section facts while the generator prompt asks to be concise |
-| **Off-Topic Rejection (Total)** | **100.0%** | `100.0%–100.0%` | All 5 off-topic queries were rejected across all 3 runs |
-| **Off-Topic Gate Only** | **60.0%** | `60.0%–60.0%` | 2 general (`0.0%`) + 1 near-domain refund (`6.8%`) passed the `25%` gate |
+| **Off-Topic Gate Only** | **60.0% (3/5)** | `60.0%–60.0%` | 2 general (`0.0%`) + 1 near-domain refund (`6.8%`) passed the `25%` gate |
+| **Off-Topic Rejection (End-to-End)** | **100.0% (5/5)** | `100.0%–100.0%` | All 5 off-topic queries were rejected across all 3 runs |
+
+Cross-encoder relevance measures topical similarity, not answerability, so the LLM `NOT_FOUND` check is a required second layer.
 
 > **Plain near-domain gate finding:** **2 of the 3 near-domain off-topic queries failed the `25%` Cross-Encoder relevance gate** across every run—*"2025 annual revenue and EBITDA margin"* scored **`35.4%`** and *"cloud migration budget and target completion quarter"* scored **`92.9%`** (because `"ACME Corp"` and `"Cloud Migration"` match the document header strongly). Both were caught downstream by the LLM `NOT_FOUND` sentinel rather than the relevance gate alone.
 

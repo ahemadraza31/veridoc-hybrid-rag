@@ -103,16 +103,17 @@ def load_persisted_state(
             with open(meta_file, "r", encoding="utf-8") as f:
                 meta = json.load(f)
 
-            saved_model = meta.get("embedding_model")
-            if saved_model != expected_embedding_model:
-                return (
-                    None,
-                    [],
-                    [],
-                    0.5,
-                    chat_history,
-                    f"Saved index embedding model ({saved_model!r}) mismatches expected ({expected_embedding_model!r}). Please re-index.",
-                )
+            if "embedding_model" in meta and meta["embedding_model"] is not None:
+                saved_model = meta["embedding_model"]
+                if saved_model != expected_embedding_model:
+                    return (
+                        None,
+                        [],
+                        [],
+                        0.5,
+                        chat_history,
+                        f"Saved index embedding model ({saved_model!r}) mismatches expected ({expected_embedding_model!r}). Please re-index.",
+                    )
 
             with open(docs_file, "r", encoding="utf-8") as f:
                 raw_docs = json.load(f)
@@ -120,6 +121,17 @@ def load_persisted_state(
                 Document(page_content=d["page_content"], metadata=d["metadata"])
                 for d in raw_docs
             ]
+
+            if "chunk_count" in meta and meta["chunk_count"] is not None:
+                if meta["chunk_count"] != len(chunks):
+                    return (
+                        None,
+                        [],
+                        [],
+                        0.5,
+                        chat_history,
+                        f"Saved metadata chunk_count ({meta['chunk_count']}) mismatches chunks ({len(chunks)}). Please re-index.",
+                    )
 
             faiss_db = FAISS.load_local(
                 faiss_dir, embed_model, allow_dangerous_deserialization=True
