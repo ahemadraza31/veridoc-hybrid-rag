@@ -3,7 +3,7 @@ import os
 import re
 import time
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -191,13 +191,31 @@ def render_source_cards(sources: List[Dict[str, Any]]):
         )
 
 
+def _prepare_recent_history(history: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """Return last 6 messages as ('human'|'assistant', clipped_text), stripping fallback notices."""
+    turns: List[Tuple[str, str]] = []
+    for m in history[-6:]:
+        role = m.get("role", "user")
+        content = str(m.get("content", ""))
+        if role == "assistant":
+            content = re.sub(
+                r"^(?:>\s*)?(?:ℹ️|⚠️)?\s*\*{0,2}Note:\*{0,2}[^\n]*(?:\n+|$)",
+                "",
+                content.lstrip(),
+            ).lstrip()
+            turns.append(("assistant", content[:700]))
+        else:
+            turns.append(("human", content[:300]))
+    return turns
+
+
 def rewrite_followup_query(llm: ChatGroq, query: str, history: List[Dict[str, Any]]) -> str:
     """Rewrite follow-up questions into standalone queries using recent conversation turns."""
-    if not history:
+    turns = _prepare_recent_history(history)
+    if not turns:
         return query
-    recent = history[-4:]
     conv_text = "\n".join(
-        [f"{m['role'].upper()}: {m['content'][:250]}" for m in recent]
+        f"{'USER' if r == 'human' else 'ASSISTANT'}: {c}" for r, c in turns
     )
     prompt = (
         "Given the recent conversation and a follow-up question, rewrite the follow-up into a clear, "
@@ -205,8 +223,12 @@ def rewrite_followup_query(llm: ChatGroq, query: str, history: List[Dict[str, An
         f"Conversation:\n{conv_text}\n\nFollow-up: {query}"
     )
     try:
-        return strip_think_tags(llm.invoke(prompt).content)
+        rewritten = strip_think_tags(llm.invoke(prompt).content)
+        if not rewritten:
+            raise ValueError("Empty rewrite")
+        return rewritten
     except Exception:
+        st.caption("ℹ️ Follow-up could not be rewritten; using the raw question.")
         return query
 
 
@@ -494,8 +516,12 @@ if active_view == "💬 Chat & Q&A":
                         st.markdown(notice)
                         t_gen_start = time.time()
 
+                        fallback_msgs = _prepare_recent_history(st.session_state.chat_history) + [
+                            ("human", user_query)
+                        ]
+
                         def stream_gen():
-                            for chunk in groq_llm.stream(user_query):
+                            for chunk in groq_llm.stream(fallback_msgs):
                                 yield chunk.content
 
                         streamed_body = strip_think_tags(st.write_stream(stream_gen()))
@@ -563,8 +589,12 @@ if active_view == "💬 Chat & Q&A":
                             )
                             st.markdown(notice)
 
+                            fallback_msgs = _prepare_recent_history(st.session_state.chat_history) + [
+                                ("human", standalone_query)
+                            ]
+
                             def stream_fallback():
-                                for chunk in groq_llm.stream(standalone_query):
+                                for chunk in groq_llm.stream(fallback_msgs):
                                     yield chunk.content
 
                             streamed_body = strip_think_tags(st.write_stream(stream_fallback()))
@@ -617,8 +647,12 @@ USER QUESTION:
                                 )
                                 st.markdown(notice)
 
+                                fallback_msgs = _prepare_recent_history(st.session_state.chat_history) + [
+                                    ("human", standalone_query)
+                                ]
+
                                 def stream_fb2():
-                                    for chunk in groq_llm.stream(standalone_query):
+                                    for chunk in groq_llm.stream(fallback_msgs):
                                         yield chunk.content
 
                                 streamed_body = strip_think_tags(st.write_stream(stream_fb2()))
