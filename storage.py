@@ -172,18 +172,25 @@ def purge_old_sessions(max_age_days: int = 7) -> int:
         return 0
     cutoff = time.time() - (max_age_days * 86400)
     removed = 0
-    for entry in os.scandir(BASE_STORAGE_DIR):
-        if not entry.is_dir():
-            continue
-        latest_mtime = entry.stat().st_mtime
-        for root, _, files in os.walk(entry.path):
-            for fname in files:
-                try:
-                    fpath = os.path.join(root, fname)
-                    latest_mtime = max(latest_mtime, os.stat(fpath).st_mtime)
-                except OSError:
-                    pass
-        if latest_mtime < cutoff:
-            shutil.rmtree(entry.path, ignore_errors=True)
-            removed += 1
+    try:
+        entries = list(os.scandir(BASE_STORAGE_DIR))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            latest_mtime = entry.stat().st_mtime
+            for root, _, files in os.walk(entry.path):
+                for fname in files:
+                    try:
+                        fpath = os.path.join(root, fname)
+                        latest_mtime = max(latest_mtime, os.stat(fpath).st_mtime)
+                    except OSError:
+                        pass
+            if latest_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            pass
     return removed

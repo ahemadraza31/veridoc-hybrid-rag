@@ -119,7 +119,10 @@ def get_cross_encoder():
 
 @st.cache_resource
 def _run_startup_purge() -> int:
-    return purge_old_sessions(max_age_days=7)
+    try:
+        return purge_old_sessions(max_age_days=7)
+    except Exception:
+        return 0
 
 
 # ----------------- SESSION INITIALIZATION -----------------
